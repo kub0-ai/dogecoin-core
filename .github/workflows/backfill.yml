@@ -27,7 +27,7 @@ jobs:
           if [ -n "${{ github.event.inputs.keys }}" ]; then
             echo "keys=${{ github.event.inputs.keys }}" >> "$GITHUB_OUTPUT"
           else
-            echo "keys=$(tr '\n' ' ' < KEYS)" >> "$GITHUB_OUTPUT"
+            echo "keys=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up QEMU

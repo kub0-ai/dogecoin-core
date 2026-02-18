@@ -27,14 +27,27 @@ RUN set -ex \
        linux/arm64) ARCH=aarch64-linux-gnu ;; \
        *) echo "Unsupported platform: ${TARGETPLATFORM}" && exit 1 ;; \
      esac \
-  && for key in ${KEYS}; do \
-       gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "$key" || \
-       gpg --batch --keyserver keys.openpgp.org --recv-keys "$key" || \
-       gpg --batch --keyserver pgp.mit.edu --recv-keys "$key" ; \
-     done \
-  && curl -SLO https://github.com/dogecoin/dogecoin/releases/download/v${DOGECOIN_VERSION}/dogecoin-${DOGECOIN_VERSION}-${ARCH}.tar.gz \
   && curl -SLO https://github.com/dogecoin/dogecoin/releases/download/v${DOGECOIN_VERSION}/SHA256SUMS.asc \
-  && gpg --verify SHA256SUMS.asc \
+  && if [ -n "${KEYS}" ]; then \
+       echo "Importing provided keys..."; \
+       for key in ${KEYS}; do \
+         gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "$key" || \
+         gpg --batch --keyserver keys.openpgp.org --recv-keys "$key" || \
+         gpg --batch --keyserver pgp.mit.edu --recv-keys "$key" ; \
+       done; \
+     else \
+       echo "Auto-discovering signing keys from SHA256SUMS.asc..."; \
+       AUTO_KEYS=$(gpg --list-packets SHA256SUMS.asc 2>/dev/null | grep "keyid" | awk '{print $NF}' | sort -u); \
+       for key in $AUTO_KEYS; do \
+         gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "$key" || \
+         gpg --batch --keyserver keys.openpgp.org --recv-keys "$key" || \
+         gpg --batch --keyserver pgp.mit.edu --recv-keys "$key" ; \
+       done; \
+     fi \
+  && if ! gpg --verify --status-fd=1 SHA256SUMS.asc 2>/dev/null | grep -qE "GOODSIG|EXPKEYSIG"; then \
+       echo "ERROR: No valid GPG signature found in SHA256SUMS.asc"; exit 1; \
+     fi \
+  && curl -SLO https://github.com/dogecoin/dogecoin/releases/download/v${DOGECOIN_VERSION}/dogecoin-${DOGECOIN_VERSION}-${ARCH}.tar.gz \
   && grep " dogecoin-${DOGECOIN_VERSION}-${ARCH}.tar.gz" SHA256SUMS.asc | sha256sum -c - \
   && tar -xzf *.tar.gz -C /opt \
   && rm *.tar.gz *.asc
