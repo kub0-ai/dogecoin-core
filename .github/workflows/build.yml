@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -52,3 +52,10 @@ jobs:
             ghcr.io/kub0-ai/dogecoin-core:latest
           cache-from: type=registry,ref=ghcr.io/kub0-ai/dogecoin-core:buildcache
           cache-to: type=registry,ref=ghcr.io/kub0-ai/dogecoin-core:buildcache,mode=max
+
+      - name: Create git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${{ steps.version.outputs.version }}" -m "Dogecoin Core ${{ steps.version.outputs.version }}" || true
+          git push origin "v${{ steps.version.outputs.version }}" || true

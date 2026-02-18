@@ -37,7 +37,7 @@ RUN set -ex \
        done; \
      else \
        echo "Auto-discovering signing keys from SHA256SUMS.asc..."; \
-       AUTO_KEYS=$(gpg --list-packets SHA256SUMS.asc 2>/dev/null | grep "keyid" | awk '{print $NF}' | sort -u); \
+       AUTO_KEYS=$(gpg --verify --status-fd=1 SHA256SUMS.asc 2>/dev/null | grep -oE '[0-9A-F]{16,40}' | sort -u || true); \
        for key in $AUTO_KEYS; do \
          gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "$key" || \
          gpg --batch --keyserver keys.openpgp.org --recv-keys "$key" || \
