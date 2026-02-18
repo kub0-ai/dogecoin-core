@@ -1,0 +1,9 @@
+Dogecoin Core {{ .Chart.AppVersion }} deployed.
+
+RPC:
+  kubectl port-forward svc/{{ include "dogecoin-core.fullname" . }} 22555:{{ .Values.service.rpcPort }}
+  dogecoin-cli -rpcconnect=127.0.0.1 -rpcport=22555 getinfo
+
+P2P port: {{ .Values.service.p2pPort }}
+
+Data volume: {{ .Values.persistence.size }}

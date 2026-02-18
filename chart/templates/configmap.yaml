@@ -1,0 +1,11 @@
+{{- if .Values.config }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dogecoin-core.fullname" . }}
+  labels:
+    {{- include "dogecoin-core.labels" . | nindent 4 }}
+data:
+  dogecoin.conf: |
+    {{- .Values.config | nindent 4 }}
+{{- end }}

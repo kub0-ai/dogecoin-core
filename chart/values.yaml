@@ -1,0 +1,38 @@
+image:
+  repository: ghcr.io/kub0-ai/dogecoin-core
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+replicaCount: 1
+
+persistence:
+  enabled: true
+  size: 100Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+
+service:
+  type: ClusterIP
+  rpcPort: 22555
+  p2pPort: 22556
+
+# dogecoin.conf contents (set to "" to skip ConfigMap)
+config: |
+  server=1
+  rpcallowip=0.0.0.0/0
+  rpcbind=0.0.0.0
+  printtoconsole=1
+
+resources: {}
+  # limits:
+  #   memory: 2Gi
+  # requests:
+  #   cpu: 250m
+  #   memory: 1Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

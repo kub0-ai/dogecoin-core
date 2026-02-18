@@ -1,0 +1,97 @@
+name: Watch Upstream Release
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get latest upstream release
+        id: upstream
+        run: |
+          LATEST=$(curl -s https://api.github.com/repos/dogecoin/dogecoin/releases/latest | jq -r '.tag_name')
+          VERSION="${LATEST#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream: $LATEST ($VERSION)"
+
+      - name: Read current version
+        id: current
+        run: |
+          CURRENT=$(cat VERSION | tr -d '[:space:]')
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "Current: $CURRENT"
+
+      - name: Check if update needed
+        id: check
+        run: |
+          if [ "${{ steps.upstream.outputs.version }}" = "${{ steps.current.outputs.version }}" ]; then
+            echo "Already up to date"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version available: ${{ steps.upstream.outputs.version }}"
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect signing keys
+        if: steps.check.outputs.needed == 'true'
+        id: keys
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          curl -sLO "https://github.com/dogecoin/dogecoin/releases/download/v${VERSION}/SHA256SUMS.asc" || true
+          if [ -f SHA256SUMS.asc ]; then
+            KEY_IDS=$(gpg --list-packets SHA256SUMS.asc 2>/dev/null | grep "keyid" | awk '{print $NF}' | sort -u | tr '\n' ' ')
+            echo "key_ids=$KEY_IDS" >> "$GITHUB_OUTPUT"
+            echo "Detected signing key IDs: $KEY_IDS"
+          else
+            echo "key_ids=unable to fetch" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release PR
+        if: steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          BRANCH="release/${VERSION}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+
+          echo "$VERSION" > VERSION
+
+          git add VERSION
+          git commit -m "release: bump to v${VERSION}"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --title "Release ${VERSION}" \
+            --body "$(cat <<EOF
+          ## Dogecoin Core ${VERSION}
+
+          Upstream release: https://github.com/dogecoin/dogecoin/releases/tag/${{ steps.upstream.outputs.tag }}
+
+          ### Detected signing key IDs
+          \`\`\`
+          ${{ steps.keys.outputs.key_ids }}
+          \`\`\`
+
+          ### Action required
+          - [ ] Verify GPG signing keys match known Dogecoin maintainer keys
+          - [ ] Update \`KEYS\` file if signers changed
+          - [ ] Review upstream release notes for breaking changes
+
+          Merging this PR triggers a build of \`ghcr.io/kub0-ai/dogecoin-core:${VERSION}\`.
+          EOF
+          )"
