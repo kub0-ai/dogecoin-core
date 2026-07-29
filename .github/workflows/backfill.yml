@@ -7,7 +7,7 @@ on:
         description: 'Dogecoin Core version (e.g., 1.14.8)'
         required: true
       keys:
-        description: 'GPG keys (space-separated, overrides auto-discovery)'
+        description: 'GPG key fingerprints (space-separated). Leave empty to use repo KEYS file. Empty KEYS file fails closed (no TOFU).'
         required: false
 
 permissions:
@@ -21,14 +21,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Resolve KEYS
+      - name: Resolve KEYS (non-empty required — no TOFU path)
         id: keys
         run: |
+          set -euo pipefail
           if [ -n "${{ github.event.inputs.keys }}" ]; then
-            echo "keys=${{ github.event.inputs.keys }}" >> "$GITHUB_OUTPUT"
+            RESOLVED="${{ github.event.inputs.keys }}"
+            # collapse whitespace
+            RESOLVED=$(echo "$RESOLVED" | xargs)
           else
-            echo "keys=" >> "$GITHUB_OUTPUT"
+            RESOLVED=$(tr '\n' ' ' < KEYS | xargs)
           fi
+          if [ -z "$RESOLVED" ]; then
+            echo "ERROR: KEYS must be non-empty (workflow input or KEYS file). TOFU auto-import is disabled."
+            exit 1
+          fi
+          echo "keys=$RESOLVED" >> "$GITHUB_OUTPUT"
+          echo "Using KEYS: $RESOLVED"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

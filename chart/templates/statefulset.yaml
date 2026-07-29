@@ -21,10 +21,15 @@ spec:
       {{- end }}
       securityContext:
         fsGroup: 101
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
           ports:
             - name: rpc
               containerPort: 22555
@@ -36,6 +41,7 @@ spec:
             exec:
               command:
                 - dogecoin-cli
+                - -datadir=/home/dogecoin/.dogecoin
                 - getinfo
             initialDelaySeconds: 60
             periodSeconds: 120
@@ -44,6 +50,7 @@ spec:
             exec:
               command:
                 - dogecoin-cli
+                - -datadir=/home/dogecoin/.dogecoin
                 - getinfo
             initialDelaySeconds: 30
             periodSeconds: 30

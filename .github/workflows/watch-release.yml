@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   check:
@@ -15,7 +16,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Detect upstream + bump main if needed
+      - name: Get latest upstream release (max semver, not publish order)
+        id: upstream
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -31,20 +33,109 @@ jobs:
               | last
             ')
           if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
-            echo "Could not detect upstream version"; exit 1
+            echo "Could not detect upstream version (rate-limited or no stable release)"
+            exit 1
           fi
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "tag=v${LATEST}" >> "$GITHUB_OUTPUT"
+          echo "repo=$UPSTREAM_REPO" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream (max semver): v${LATEST}"
+
+      - name: Read current version
+        id: current
+        run: |
           CURRENT=$(tr -d '[:space:]' < VERSION)
-          echo "upstream=$LATEST current=$CURRENT"
-          if [ "$LATEST" = "$CURRENT" ]; then
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "Current: $CURRENT"
+
+      - name: Check if update needed
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.upstream.outputs.version }}"
+          CURRENT="${{ steps.current.outputs.version }}"
+          if [ "$VERSION" = "$CURRENT" ]; then
             echo "Already up to date"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Direct bump on main → build.yml (paths: VERSION) rebuilds the image.
-          # Org setting blocks Actions from opening PRs; direct commit is the reliable path.
+          EXISTING_PR=$(gh pr list --head "release/${VERSION}" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #${EXISTING_PR} already open for ${VERSION}"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "New version available: ${VERSION}"
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Detect signing key IDs from release (informational)
+        if: steps.check.outputs.needed == 'true'
+        id: keys
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.upstream.outputs.version }}"
+          curl -sLO "https://github.com/dogecoin/dogecoin/releases/download/v${VERSION}/SHA256SUMS.asc" || true
+          if [ -f SHA256SUMS.asc ]; then
+            KEY_IDS=$(gpg --list-packets SHA256SUMS.asc 2>/dev/null | grep -i "keyid\|key id" | awk '{print $NF}' | sort -u | tr '\n' ' ' || true)
+            if [ -z "$KEY_IDS" ]; then
+              KEY_IDS=$(gpg --verify --status-fd=1 SHA256SUMS.asc 2>/dev/null | awk '/VALIDSIG|GOODSIG/ {print $3}' | sort -u | tr '\n' ' ' || true)
+            fi
+            echo "key_ids=${KEY_IDS:-unable to parse}" >> "$GITHUB_OUTPUT"
+          else
+            echo "key_ids=unable to fetch" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release branch + PR (human GPG gate — never push main)
+        if: steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.upstream.outputs.version }}"
+          BRANCH="release/${VERSION}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "$LATEST" > VERSION
-          git add VERSION
-          git commit -m "release: bump to v${LATEST} (auto from ${UPSTREAM_REPO})"
-          git push origin HEAD:main
-          echo "Pushed VERSION ${CURRENT} → ${LATEST}; build.yml will remake the image"
+
+          if git ls-remote --exit-code origin "refs/heads/${BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "${BRANCH}"
+            git checkout "${BRANCH}"
+            echo "$VERSION" > VERSION
+            if ! git diff --quiet VERSION; then
+              git add VERSION
+              git commit -m "release: bump to v${VERSION}"
+              git push origin "${BRANCH}"
+            fi
+          else
+            git checkout -b "$BRANCH"
+            echo "$VERSION" > VERSION
+            git add VERSION
+            git commit -m "release: bump to v${VERSION}"
+            git push origin "$BRANCH"
+          fi
+
+          if ! gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' | grep -q .; then
+            gh pr create \
+              --title "Release ${VERSION}" \
+              --body "$(cat <<EOF
+          ## Dogecoin Core ${VERSION}
+
+          Upstream release: https://github.com/${{ steps.upstream.outputs.repo }}/releases/tag/${{ steps.upstream.outputs.tag }}
+
+          ### Detected signing key IDs (informational)
+          \`\`\`
+          ${{ steps.keys.outputs.key_ids }}
+          \`\`\`
+
+          ### Action required (human gate — GPG)
+          - [ ] Verify GPG signing keys match trusted upstream signers (e.g. \`contrib/gitian-keys\` / release notes)
+          - [ ] Confirm fingerprint is present in repo \`KEYS\` (or update \`KEYS\` if signers changed)
+          - [ ] Review upstream release notes for breaking changes
+          - [ ] Do **not** merge until GOODSIG + VALIDSIG ∈ KEYS is expected for this version
+
+          Merging this PR to \`main\` triggers \`build.yml\` → \`ghcr.io/kub0-ai/dogecoin-core:${VERSION}\`.
+          This workflow does **not** push \`main\` directly.
+          EOF
+          )" || true
+          fi

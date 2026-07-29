@@ -20,11 +20,28 @@ service:
   p2pPort: 22556
 
 # dogecoin.conf contents (set to "" to skip ConfigMap)
+# RPC: default allowlist is private RFC1918 ranges only — never 0.0.0.0/0.
+# Override for your CNI pod/service CIDRs. Pair with cookie auth or rpcauth;
+# do not put rpcpassword in this ConfigMap (use a Secret + extra mounts).
 config: |
   server=1
-  rpcallowip=0.0.0.0/0
+  rpcallowip=10.0.0.0/8
+  rpcallowip=172.16.0.0/12
+  rpcallowip=192.168.0.0/16
   rpcbind=0.0.0.0
   printtoconsole=1
+
+# Container securityContext (uid/gid match docker image dogecoin user 101)
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 101
+  runAsGroup: 101
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  # data dir is a volume; keep RW rootfs so gosu/entrypoint paths work
+  readOnlyRootFilesystem: false
 
 resources: {}
   # limits:
