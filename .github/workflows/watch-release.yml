@@ -44,7 +44,7 @@ jobs:
           CURRENT=$(tr -d '[:space:]' < VERSION)
           echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
 
-      - name: Ensure release branch + PR (auto-merge when checks pass)
+      - name: Ensure release branch + PR (auto-merge)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -82,7 +82,7 @@ jobs:
 
           Upstream release: https://github.com/dogecoin/dogecoin/releases/tag/${{ steps.upstream.outputs.tag }}
 
-          Auto-merge enabled after checks. Verify GPG if KEYS changed.
+          Auto-merged by watch-release → build.yml remakes the image.
 
           Merging triggers build of \`ghcr.io/kub0-ai/dogecoin-core:${VERSION}\`.
           EOF
@@ -90,7 +90,6 @@ jobs:
             PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
           fi
           if [ -n "$PR" ]; then
-            # Immediate squash merge → main → build.yml remakes the image.
             gh pr merge "$PR" --squash --delete-branch || gh pr merge "$PR" --auto --squash || true
             echo "PR #${PR} merge requested (rebuild of ghcr.io/kub0-ai/dogecoin-core:${VERSION})"
           fi
