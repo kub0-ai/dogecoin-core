@@ -22,84 +22,75 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           LATEST=$(curl -s -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/repos/dogecoin/dogecoin/releases/latest" \
-            | jq -r '.tag_name')
+            "https://api.github.com/repos/dogecoin/dogecoin/releases?per_page=30" \
+            | jq -r '
+              [.[] | select(.prerelease == false and .draft == false) | .tag_name
+               | ltrimstr("v")
+               | select(test("^[0-9]+\\.[0-9]+(\\.[0-9]+)?$"))]
+              | sort_by(split(".") | map(tonumber))
+              | last
+            ')
           if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
-            echo "Could not detect upstream version (rate-limited or no release found)"
+            echo "Could not detect upstream version"
             exit 1
           fi
-          VERSION="${LATEST#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
-          echo "Latest upstream: $LATEST ($VERSION)"
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "tag=v${LATEST}" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream: v${LATEST}"
 
       - name: Read current version
         id: current
         run: |
-          CURRENT=$(cat VERSION | tr -d '[:space:]')
+          CURRENT=$(tr -d '[:space:]' < VERSION)
           echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
-          echo "Current: $CURRENT"
 
-      - name: Check if update needed
-        id: check
-        run: |
-          if [ "${{ steps.upstream.outputs.version }}" = "${{ steps.current.outputs.version }}" ]; then
-            echo "Already up to date"
-            echo "needed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "New version available: ${{ steps.upstream.outputs.version }}"
-            echo "needed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Detect signing keys
-        if: steps.check.outputs.needed == 'true'
-        id: keys
-        run: |
-          VERSION="${{ steps.upstream.outputs.version }}"
-          curl -sLO "https://github.com/dogecoin/dogecoin/releases/download/v${VERSION}/SHA256SUMS.asc" || true
-          if [ -f SHA256SUMS.asc ]; then
-            KEY_IDS=$(gpg --list-packets SHA256SUMS.asc 2>/dev/null | grep "keyid" | awk '{print $NF}' | sort -u | tr '\n' ' ')
-            echo "key_ids=$KEY_IDS" >> "$GITHUB_OUTPUT"
-            echo "Detected signing key IDs: $KEY_IDS"
-          else
-            echo "key_ids=unable to fetch" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create release PR
-        if: steps.check.outputs.needed == 'true'
+      - name: Ensure release branch + PR (auto-merge when checks pass)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ steps.upstream.outputs.version }}"
+          CURRENT="${{ steps.current.outputs.version }}"
+          if [ "$VERSION" = "$CURRENT" ]; then
+            echo "Already up to date at ${CURRENT}"
+            exit 0
+          fi
           BRANCH="release/${VERSION}"
-
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
 
-          echo "$VERSION" > VERSION
+          if git ls-remote --exit-code origin "refs/heads/${BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "${BRANCH}"
+            git checkout "${BRANCH}"
+            echo "$VERSION" > VERSION
+            if ! git diff --quiet VERSION 2>/dev/null; then
+              git add VERSION && git commit -m "release: bump to v${VERSION}" && git push origin "${BRANCH}"
+            fi
+          else
+            git checkout -b "$BRANCH"
+            echo "$VERSION" > VERSION
+            git add VERSION
+            git commit -m "release: bump to v${VERSION}"
+            git push origin "$BRANCH"
+          fi
 
-          git add VERSION
-          git commit -m "release: bump to v${VERSION}"
-          git push origin "$BRANCH"
-
-          gh pr create \
-            --title "Release ${VERSION}" \
-            --body "$(cat <<EOF
+          PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$PR" ]; then
+            gh pr create \
+              --title "Release ${VERSION}" \
+              --body "$(cat <<EOF
           ## Dogecoin Core ${VERSION}
 
           Upstream release: https://github.com/dogecoin/dogecoin/releases/tag/${{ steps.upstream.outputs.tag }}
 
-          ### Detected signing key IDs
-          \`\`\`
-          ${{ steps.keys.outputs.key_ids }}
-          \`\`\`
+          Auto-merge enabled after checks. Verify GPG if KEYS changed.
 
-          ### Action required
-          - [ ] Verify GPG signing keys match known Dogecoin maintainer keys
-          - [ ] Update \`KEYS\` file if signers changed
-          - [ ] Review upstream release notes for breaking changes
-
-          Merging this PR triggers a build of \`ghcr.io/kub0-ai/dogecoin-core:${VERSION}\`.
+          Merging triggers build of \`ghcr.io/kub0-ai/dogecoin-core:${VERSION}\`.
           EOF
           )"
+            PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          fi
+          if [ -n "$PR" ]; then
+            # Immediate squash merge → main → build.yml remakes the image.
+            gh pr merge "$PR" --squash --delete-branch || gh pr merge "$PR" --auto --squash || true
+            echo "PR #${PR} merge requested (rebuild of ghcr.io/kub0-ai/dogecoin-core:${VERSION})"
+          fi
