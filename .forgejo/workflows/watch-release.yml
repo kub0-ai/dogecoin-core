@@ -1,0 +1,152 @@
+name: Watch Upstream Release
+
+# Forgejo-native twin of .github/workflows/watch-release.yml.
+#
+# WHY THIS FILE EXISTS
+# Forgejo reads .forgejo/workflows/ EXCLUSIVELY when that directory is present --
+# .github/workflows/ is then ignored entirely. This repo has
+# .forgejo/workflows/build.yml, so the GitHub watcher was invisible to Forgejo and
+# its `schedule:` never registered: zero scheduled runs on this forge, ever, despite
+# the cron sitting in .github/workflows/watch-release.yml. (Confirmed 2026-08-13
+# against Forgejo's action_schedule table -- no row existed for this repo.)
+#
+# DELIBERATE DIFFERENCES FROM THE GITHUB TWIN
+# 1. The api.github.com call below is UNAUTHENTICATED. The only token available on a
+#    Forgejo runner is a Forgejo credential; sending it to a third-party API would
+#    leak it. Unauthenticated is 60 req/hr/IP -- ample for one daily poll.
+# 2. `gh pr list` / `gh pr create` are replaced with Forgejo API calls; the gh CLI
+#    targets github.com. The git push logic is unchanged: actions/checkout persists
+#    runner credentials on Forgejo the same way it does on GitHub.
+# 3. Cron is offset 30 minutes from the GitHub twin so the two forges' watchers are
+#    distinguishable in logs and do not poll upstream in the same second.
+# 4. The informational "detected signing key IDs" step is not duplicated here -- it is
+#    advisory output only, and keeping it in one place avoids a second copy to rot.
+#    The GPG gate itself (the human checklist below) is preserved.
+#
+# This workflow never pushes main. It only ever opens a PR for a human to review.
+
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: docker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Get latest upstream release (max semver, not publish order)
+        id: upstream
+        run: |
+          set -euo pipefail
+          UPSTREAM_REPO="dogecoin/dogecoin"
+          # Unauthenticated on purpose -- see header note 1.
+          LATEST=$(curl -sSf "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=30" \
+            | jq -r '
+              [.[] | select(.prerelease == false and .draft == false) | .tag_name
+               | ltrimstr("v")
+               | select(test("^[0-9]+(\\.[0-9]+){1,3}$"))]
+              | sort_by(split(".") | map(tonumber))
+              | last
+            ')
+          if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+            echo "Could not detect upstream version (rate-limited or no stable release)"
+            exit 1
+          fi
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "tag=v${LATEST}" >> "$GITHUB_OUTPUT"
+          echo "repo=$UPSTREAM_REPO" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream (max semver): v${LATEST}"
+
+      - name: Read current version
+        id: current
+        run: |
+          set -euo pipefail
+          CURRENT=$(tr -d '[:space:]' < VERSION)
+          if [ -z "$CURRENT" ]; then
+            echo "VERSION file is empty"; exit 1
+          fi
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "Current: $CURRENT"
+
+      - name: Check if update needed
+        id: check
+        env:
+          FJ_TOKEN: ${{ secrets.WATCHER_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.upstream.outputs.version }}"
+          CURRENT="${{ steps.current.outputs.version }}"
+          if [ "$VERSION" = "$CURRENT" ]; then
+            echo "Already up to date"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          API="${{ github.server_url }}/api/v1/repos/${{ github.repository }}"
+          OPEN=$(curl -sSf -H "Authorization: token $FJ_TOKEN" "$API/pulls?state=open&limit=50" \
+            | jq -r --arg h "release/${VERSION}" '[.[] | select(.head.ref == $h) | .number] | first // empty')
+          if [ -n "$OPEN" ]; then
+            echo "PR #${OPEN} already open for ${VERSION}"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "New version available: ${VERSION}"
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create release branch + PR (human GPG gate -- never push main)
+        if: steps.check.outputs.needed == 'true'
+        env:
+          FJ_TOKEN: ${{ secrets.WATCHER_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.upstream.outputs.version }}"
+          BRANCH="release/${VERSION}"
+          API="${{ github.server_url }}/api/v1/repos/${{ github.repository }}"
+
+          git config user.name "forgejo-actions[bot]"
+          git config user.email "forgejo-actions[bot]@noreply.localhost"
+
+          if git ls-remote --exit-code origin "refs/heads/${BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "${BRANCH}"
+            git checkout "${BRANCH}"
+            echo "$VERSION" > VERSION
+            if ! git diff --quiet VERSION; then
+              git add VERSION
+              git commit -m "release: bump to v${VERSION}"
+              git push origin "${BRANCH}"
+            fi
+          else
+            git checkout -b "$BRANCH"
+            echo "$VERSION" > VERSION
+            git add VERSION
+            git commit -m "release: bump to v${VERSION}"
+            git push origin "$BRANCH"
+          fi
+
+          BODY=$(cat <<BODYEOF
+          ## Dogecoin Core ${VERSION}
+
+          Upstream release: https://github.com/${{ steps.upstream.outputs.repo }}/releases/tag/v${VERSION}
+
+          ### Action required (human gate -- GPG)
+          - [ ] Verify SHA256SUMS.asc against the pinned signer set in KEYS
+          - [ ] If the signer set changed, update KEYS in the same commit
+          - [ ] Review upstream release notes for breaking changes
+
+          Merging this PR triggers .forgejo/workflows/build.yml, which publishes
+          ghcr.io/${{ github.repository }}:${VERSION} and moves :latest.
+          Direct pushes to main for VERSION bumps are intentionally disabled.
+
+          Opened by the Forgejo-native watcher. The GitHub twin raises the equivalent
+          PR on the GitHub mirror; the two are independent and either may be used.
+          BODYEOF
+          )
+
+          jq -n --arg head "$BRANCH" --arg base "main" \
+                --arg title "Release ${VERSION}" --arg body "$BODY" \
+                '{head: $head, base: $base, title: $title, body: $body}' \
+            | curl -sSf -X POST -H "Authorization: token $FJ_TOKEN" \
+                -H "Content-Type: application/json" "$API/pulls" -d @- \
+            | jq -r '"opened PR #\(.number): \(.title)"'
