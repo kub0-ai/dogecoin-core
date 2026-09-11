@@ -1,5 +1,29 @@
 name: Watch Upstream Release
 
+# Two-stage release automation with a SIGNER-CONDITIONAL human gate.
+#
+#   detect upstream -> preflight the Dockerfile's own GPG gate -> decide:
+#     PASS : auto-merge the release PR, then dispatch build.yml. Hands-off.
+#            The trust root (KEYS) already covers this release, so a human
+#            clicking "merge" adds no security -- only latency.
+#     FAIL : open/keep the PR, DO NOT merge, exit 1 (red). A human must review
+#            the signer change and decide whether to extend KEYS.
+#
+# NOTE: dogecoin-core's KEYS allowlist holds a SINGLE fingerprint, so any
+# rotation of the upstream release signer fails the preflight and is held.
+# That is the intended behaviour -- with one trusted signer there is no
+# redundancy, and a swap is exactly the event a person should look at.
+#
+# Why an explicit workflow_dispatch instead of relying on build.yml's push
+# trigger: events raised by the default GITHUB_TOKEN do not create new workflow
+# runs (GitHub's anti-recursion rule), so an auto-merged VERSION bump would land
+# on main and never build. workflow_dispatch and repository_dispatch are the
+# documented exceptions -- they always create a run. Hence `gh workflow run`.
+#
+# Why FAIL is red rather than a quiet PR: this job used to `exit 0` on BOTH
+# "already up to date" AND "PR already open", making a stalled release
+# indistinguishable from a healthy repo in the runs list.
+
 on:
   schedule:
     - cron: '0 6 * * *'
@@ -8,6 +32,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write # required to dispatch build.yml
 
 jobs:
   check:
@@ -15,6 +40,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # "In a public repository, scheduled workflows are automatically disabled
+      # when no repository activity has occurred in 60 days." A quiet upstream
+      # therefore kills this watcher -- and GitHub does NOT re-enable on new
+      # activity, it requires a manual click. So keep the repo warm well inside
+      # the window rather than trying to cure it afterwards. Runs daily, acts
+      # roughly monthly, and sustains itself because acting resets the clock.
+      - name: Keepalive (prevent 60-day cron auto-disable)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LAST=$(git log -1 --format=%ct main 2>/dev/null || git log -1 --format=%ct)
+          AGE=$(( ( $(date +%s) - LAST ) / 86400 ))
+          echo "days since last commit on main: ${AGE}"
+          if [ "$AGE" -ge 40 ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive — hold scheduled workflows active (${AGE}d quiet)"
+            git push origin HEAD:main
+            echo "::notice title=Keepalive::pushed empty commit after ${AGE} quiet days"
+          fi
 
       - name: Get latest upstream release (max semver, not publish order)
         id: upstream
@@ -44,6 +93,7 @@ jobs:
       - name: Read current version
         id: current
         run: |
+          set -euo pipefail
           CURRENT=$(tr -d '[:space:]' < VERSION)
           echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "Current: $CURRENT"
@@ -51,91 +101,209 @@ jobs:
       - name: Check if update needed
         id: check
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: ${{ steps.upstream.outputs.version }}
+          CURRENT: ${{ steps.current.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ steps.upstream.outputs.version }}"
-          CURRENT="${{ steps.current.outputs.version }}"
-          if [ "$VERSION" = "$CURRENT" ]; then
-            echo "Already up to date"
+          if [ "$UPSTREAM" = "$CURRENT" ]; then
+            echo "Already up to date at ${CURRENT}"
             echo "needed=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Up to date"
+              echo ""
+              echo "\`VERSION\` = upstream latest = \`${CURRENT}\`. Nothing to do."
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          EXISTING_PR=$(gh pr list --head "release/${VERSION}" --state open --json number --jq '.[0].number // empty')
-          if [ -n "$EXISTING_PR" ]; then
-            echo "PR #${EXISTING_PR} already open for ${VERSION}"
-            echo "needed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "New version available: ${VERSION}"
+          echo "New version available: ${CURRENT} -> ${UPSTREAM}"
           echo "needed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Detect signing key IDs from release (informational)
+      # Preflight the EXACT gate docker/Dockerfile applies at build time:
+      #   import only KEYS-allowlisted fingerprints (no TOFU),
+      #   require >=1 GOODSIG (EXPKEYSIG alone is not accepted),
+      #   require every VALIDSIG fingerprint to be inside the allowlist.
+      # dogecoin ships a CLEARSIGNED SHA256SUMS.asc, so gpg --verify takes one
+      # argument, not a detached-signature pair.
+      - name: Preflight signing gate
         if: steps.check.outputs.needed == 'true'
-        id: keys
+        id: gpg
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ steps.upstream.outputs.version }}"
-          curl -sLO "https://github.com/dogecoin/dogecoin/releases/download/v${VERSION}/SHA256SUMS.asc" || true
-          if [ -f SHA256SUMS.asc ]; then
-            KEY_IDS=$(gpg --list-packets SHA256SUMS.asc 2>/dev/null | grep -i "keyid\|key id" | awk '{print $NF}' | sort -u | tr '\n' ' ' || true)
-            if [ -z "$KEY_IDS" ]; then
-              KEY_IDS=$(gpg --verify --status-fd=1 SHA256SUMS.asc 2>/dev/null | awk '/VALIDSIG|GOODSIG/ {print $3}' | sort -u | tr '\n' ' ' || true)
-            fi
-            echo "key_ids=${KEY_IDS:-unable to parse}" >> "$GITHUB_OUTPUT"
-          else
-            echo "key_ids=unable to fetch" >> "$GITHUB_OUTPUT"
+          WORK=$(mktemp -d); export GNUPGHOME=$(mktemp -d); chmod 700 "$GNUPGHOME"
+          KEYS=$(tr '\n' ' ' < KEYS)
+
+          if ! curl -sSLf -o "$WORK/SHA256SUMS.asc" \
+                 "https://github.com/dogecoin/dogecoin/releases/download/v${VERSION}/SHA256SUMS.asc"; then
+            echo "verdict=fail" >> "$GITHUB_OUTPUT"
+            echo "reason=upstream v${VERSION} publishes no SHA256SUMS.asc yet" >> "$GITHUB_OUTPUT"
+            echo "good=0" >> "$GITHUB_OUTPUT"; echo "unknown=0" >> "$GITHUB_OUTPUT"; echo "expired=0" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-      - name: Create release branch + PR (human GPG gate — never push main)
+          # Import ONLY allowlisted keys. An unknown signer is therefore never
+          # imported, yields NO_PUBKEY rather than VALIDSIG, and is ignored --
+          # it can neither grant nor withdraw trust.
+          for key in $KEYS; do
+            gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "$key" >/dev/null 2>&1 \
+              || gpg --batch --keyserver keys.openpgp.org --recv-keys "$key" >/dev/null 2>&1 \
+              || gpg --batch --keyserver pgp.mit.edu --recv-keys "$key" >/dev/null 2>&1 \
+              || echo "WARN: could not fetch allowlisted key $key from any keyserver"
+          done
+
+          STATUS=$(gpg --verify --status-fd=1 "$WORK/SHA256SUMS.asc" 2>/dev/null || true)
+
+          # NOTE: herestrings, not pipelines. `CMD | grep -q PAT` under pipefail
+          # returns 141 (SIGPIPE) when PAT matches, which silently inverts the
+          # test. Feed grep from <<< so there is no pipe to break.
+          GOOD=$(grep -c '^\[GNUPG:\] GOODSIG '   <<< "$STATUS" || true)
+          UNKNOWN=$(grep -c '^\[GNUPG:\] NO_PUBKEY ' <<< "$STATUS" || true)
+          EXPIRED=$(grep -c '^\[GNUPG:\] EXPKEYSIG ' <<< "$STATUS" || true)
+
+          ALLOW=$(echo "$KEYS" | tr -d '[:space:]' | tr 'a-f' 'A-F')
+          ROGUE=""
+          while read -r sign_fp primary_fp; do
+            [ -z "${sign_fp:-}" ] && continue
+            matched=0
+            for fp in "$sign_fp" "$primary_fp"; do
+              [ -z "$fp" ] && continue
+              case "$ALLOW" in *"$fp"*) matched=1; break ;; esac
+            done
+            [ "$matched" -eq 1 ] || ROGUE="${ROGUE} ${sign_fp}"
+          done < <(awk '/^\[GNUPG:\] VALIDSIG /{print toupper($3), toupper($NF)}' <<< "$STATUS")
+
+          VERDICT=pass
+          REASON="gate satisfied"
+          if [ "$GOOD" -lt 1 ]; then
+            VERDICT=fail
+            REASON="no GOODSIG from the allowlisted signer (EXPKEYSIG alone is not accepted) — upstream signer may have rotated"
+          elif [ -n "$ROGUE" ]; then
+            VERDICT=fail
+            REASON="VALIDSIG fingerprint(s) outside the KEYS allowlist:${ROGUE}"
+          fi
+
+          {
+            echo "verdict=$VERDICT"
+            echo "reason=$REASON"
+            echo "good=$GOOD"
+            echo "unknown=$UNKNOWN"
+            echo "expired=$EXPIRED"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Signing preflight for ${VERSION} — **${VERDICT}**"
+            echo ""
+            echo "| signal | count |"
+            echo "|---|---|"
+            echo "| GOODSIG (trusted signers) | ${GOOD} |"
+            echo "| NO_PUBKEY (unknown signers, ignored) | ${UNKNOWN} |"
+            echo "| EXPKEYSIG (trusted but expired) | ${EXPIRED} |"
+            echo ""
+            echo "Verdict reason: ${REASON}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "preflight ${VERDICT}: ${REASON} (good=${GOOD} unknown=${UNKNOWN} expired=${EXPIRED})"
+
+      - name: Create or update release PR
         if: steps.check.outputs.needed == 'true'
+        id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          VERDICT: ${{ steps.gpg.outputs.verdict }}
+          REASON: ${{ steps.gpg.outputs.reason }}
+          GOOD: ${{ steps.gpg.outputs.good }}
+          UNKNOWN: ${{ steps.gpg.outputs.unknown }}
+          EXPIRED: ${{ steps.gpg.outputs.expired }}
         run: |
           set -euo pipefail
-          VERSION="${{ steps.upstream.outputs.version }}"
           BRANCH="release/${VERSION}"
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           if git ls-remote --exit-code origin "refs/heads/${BRANCH}" >/dev/null 2>&1; then
-            git fetch origin "${BRANCH}"
-            git checkout "${BRANCH}"
-            echo "$VERSION" > VERSION
-            if ! git diff --quiet VERSION; then
-              git add VERSION
-              git commit -m "release: bump to v${VERSION}"
-              git push origin "${BRANCH}"
-            fi
+            git fetch origin "$BRANCH"
+            git checkout "$BRANCH"
           else
             git checkout -b "$BRANCH"
-            echo "$VERSION" > VERSION
+          fi
+          echo "$VERSION" > VERSION
+          if ! git diff --quiet VERSION; then
             git add VERSION
             git commit -m "release: bump to v${VERSION}"
-            git push origin "$BRANCH"
           fi
+          git push origin "$BRANCH"
 
-          if ! gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' | grep -q .; then
-            gh pr create \
+          NUM=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$NUM" ]; then
+            gh pr create --head "$BRANCH" --base main \
               --title "Release ${VERSION}" \
               --body "$(cat <<EOF
           ## Dogecoin Core ${VERSION}
 
-          Upstream release: https://github.com/${{ steps.upstream.outputs.repo }}/releases/tag/${{ steps.upstream.outputs.tag }}
+          Upstream release: https://github.com/dogecoin/dogecoin/releases/tag/${TAG}
 
-          ### Detected signing key IDs (informational)
-          \`\`\`
-          ${{ steps.keys.outputs.key_ids }}
-          \`\`\`
+          ### Signing preflight — **${VERDICT}**
 
-          ### Action required (human gate — GPG)
-          - [ ] Verify GPG signing keys match trusted upstream signers (e.g. \`contrib/gitian-keys\` / release notes)
-          - [ ] Confirm fingerprint is present in repo \`KEYS\` (or update \`KEYS\` if signers changed)
-          - [ ] Review upstream release notes for breaking changes
-          - [ ] Do **not** merge until GOODSIG + VALIDSIG ∈ KEYS is expected for this version
+          | signal | count |
+          |---|---|
+          | GOODSIG (trusted signers) | ${GOOD} |
+          | NO_PUBKEY (unknown signers, ignored) | ${UNKNOWN} |
+          | EXPKEYSIG (trusted but expired) | ${EXPIRED} |
 
-          Merging this PR to \`main\` triggers \`build.yml\` → \`ghcr.io/kub0-ai/dogecoin-core:${VERSION}\`.
-          This workflow does **not** push \`main\` directly.
+          ${REASON}
+
+          A **pass** means the trust root in \`KEYS\` already covers this release and the
+          image build will verify cleanly — this PR is auto-merged and built.
+
+          A **fail** means this PR is held for review. \`KEYS\` holds a single trusted
+          fingerprint for this project, so a signer rotation always lands here. Confirm
+          the new signer out of band before extending \`KEYS\`, then re-run this workflow.
           EOF
-          )" || true
+          )"
+            NUM=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
           fi
+          echo "number=$NUM" >> "$GITHUB_OUTPUT"
+          echo "Release PR #${NUM} for ${VERSION}"
+
+      - name: Auto-merge and dispatch build (preflight passed)
+        if: steps.check.outputs.needed == 'true' && steps.gpg.outputs.verdict == 'pass'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+          NUM: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          gh pr merge "$NUM" --merge --delete-branch
+
+          # The merge above is authenticated with GITHUB_TOKEN, so its push does
+          # NOT trigger build.yml. Dispatch explicitly -- workflow_dispatch is a
+          # documented exception to the anti-recursion rule and always runs.
+          gh workflow run build.yml --ref main
+          {
+            echo ""
+            echo "### Auto-merged"
+            echo ""
+            echo "PR #${NUM} merged; \`build.yml\` dispatched on \`main\` for \`${VERSION}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hold for human review (preflight failed)
+        if: steps.check.outputs.needed == 'true' && steps.gpg.outputs.verdict != 'pass'
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+          REASON: ${{ steps.gpg.outputs.reason }}
+          NUM: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          {
+            echo ""
+            echo "### HELD — signing gate not satisfied"
+            echo ""
+            echo "PR #${NUM} (\`${VERSION}\`) is open and **not** merged: ${REASON}"
+            echo ""
+            echo "This run fails deliberately so the stall is visible in the runs list."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Release ${VERSION} held::${REASON} — see PR #${NUM}"
+          exit 1
